@@ -1,4 +1,75 @@
-# Performance Comparison Report: Naïve vs Optimized Limit Order Book
+import csv
+from collections import defaultdict
+
+RESULTS_CSV = "results.csv"
+OUT_MD = "report.md"
+
+def read_results(path: str):
+    rows = []
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            row["N"] = int(row["N"])
+            row["total_seconds"] = float(row["total_seconds"])
+            row["avg_seconds"] = float(row["avg_seconds"])
+            rows.append(row)
+    return rows
+
+def pivot(rows):
+    data = defaultdict(lambda: defaultdict(dict))
+    for row in rows:
+        impl = row["implementation"]
+        op = row["operation"]
+        n = row["N"]
+        data[impl][op][n] = (row["total_seconds"], row["avg_seconds"])
+    return data
+
+def fmt_total(x: float) -> str:
+    return f"{x:.6f}"
+
+def fmt_avg(x: float) -> str:
+    return f"{x:.6e}"
+
+def make_table(ns, data_impl):
+    lines = []
+    lines.append("| N | Insert total (s) | Insert avg (s/op) | Amend total (s) | Amend avg (s/op) | Delete total (s) | Delete avg (s/op) |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|")
+    for n in ns:
+        it, ia = data_impl["insert"][n]
+        at, aa = data_impl["amend"][n]
+        dt, da = data_impl["delete"][n]
+        lines.append(
+            f"| {n:,} | {fmt_total(it)} | {fmt_avg(ia)} | {fmt_total(at)} | {fmt_avg(aa)} | {fmt_total(dt)} | {fmt_avg(da)} |"
+        )
+    return "\n".join(lines)
+
+def speedup(naive_total: float, opt_total: float) -> float:
+    return float("inf") if opt_total == 0 else (naive_total / opt_total)
+
+rows = read_results(RESULTS_CSV)
+data = pivot(rows)
+
+naive_ns = sorted(data["naive"]["insert"].keys())
+opt_ns = sorted(data["optimized"]["insert"].keys())
+common_ns = sorted(set(naive_ns).intersection(opt_ns))
+n_star = max(common_ns) if common_ns else None
+
+if n_star is None:
+    raise RuntimeError("No common N between naive and optimized results; check results.csv")
+
+naive_ins = data["naive"]["insert"][n_star][0]
+naive_amd = data["naive"]["amend"][n_star][0]
+naive_del = data["naive"]["delete"][n_star][0]
+opt_ins = data["optimized"]["insert"][n_star][0]
+opt_amd = data["optimized"]["amend"][n_star][0]
+opt_del = data["optimized"]["delete"][n_star][0]
+
+s_ins = speedup(naive_ins, opt_ins)
+s_amd = speedup(naive_amd, opt_amd)
+s_del = speedup(naive_del, opt_del)
+
+# Use a RAW f-string so backslashes in LaTeX like \( \) do not trigger SyntaxWarning.
+md = rf"""# Performance Comparison Report: Naïve vs Optimized Limit Order Book
 
 **Author:** Pavlos Giannakis  
 **Repository:** `lob-benchmark`  
@@ -48,31 +119,19 @@ Let \(n\) denote the number of orders on one side of the book, \(m\) the number 
 
 For each workload size \(N\), \(N\) synthetic orders are generated using a fixed random seed for repeatability. Prices are represented as discrete integer cents to avoid floating-point equality issues in dictionary keys. Insert benchmarks measure the time to insert \(N\) orders into an initially empty book. Amend and delete benchmarks first build a book by inserting \(N\) orders and then amend or delete all \(N\) orders using randomized order IDs. Total time is measured with `time.perf_counter()`, and average time per operation is computed as total time divided by \(N\).
 
-The optimized implementation is benchmarked through \(N = 1,000,000\). The naïve implementation is benchmarked through \(N = 10,000\); beyond this point, repeated global sorts make runtime impractical on typical development machines, and the scaling trend is already clear in the measured range.
+The optimized implementation is benchmarked through \(N = {max(opt_ns):,}\). The naïve implementation is benchmarked through \(N = {max(naive_ns):,}\); beyond this point, repeated global sorts make runtime impractical on typical development machines, and the scaling trend is already clear in the measured range.
 
 ---
 
 ## 5. Measured timing tables
 
-### Naïve (measured up to 10,000)
+### Naïve (measured up to {max(naive_ns):,})
 
-| N | Insert total (s) | Insert avg (s/op) | Amend total (s) | Amend avg (s/op) | Delete total (s) | Delete avg (s/op) |
-|---:|---:|---:|---:|---:|---:|---:|
-| 10 | 0.000007 | 6.599999e-07 | 0.000008 | 8.299998e-07 | 0.000008 | 8.399998e-07 |
-| 100 | 0.000111 | 1.114000e-06 | 0.000306 | 3.060000e-06 | 0.000181 | 1.808000e-06 |
-| 1,000 | 0.009016 | 9.015600e-06 | 0.030837 | 3.083700e-05 | 0.017028 | 1.702840e-05 |
-| 10,000 | 1.181954 | 1.181954e-04 | 4.539399 | 4.539399e-04 | 2.622052 | 2.622052e-04 |
+{make_table(naive_ns, data["naive"])}
 
-### Optimized (measured up to 1,000,000)
+### Optimized (measured up to {max(opt_ns):,})
 
-| N | Insert total (s) | Insert avg (s/op) | Amend total (s) | Amend avg (s/op) | Delete total (s) | Delete avg (s/op) |
-|---:|---:|---:|---:|---:|---:|---:|
-| 10 | 0.000012 | 1.190000e-06 | 0.000003 | 2.699999e-07 | 0.000006 | 6.399998e-07 |
-| 100 | 0.000035 | 3.480000e-07 | 0.000008 | 8.399998e-08 | 0.000022 | 2.150000e-07 |
-| 1,000 | 0.000229 | 2.293000e-07 | 0.000076 | 7.630000e-08 | 0.000199 | 1.987000e-07 |
-| 10,000 | 0.002273 | 2.273000e-07 | 0.001079 | 1.078900e-07 | 0.002560 | 2.560300e-07 |
-| 100,000 | 0.039524 | 3.952380e-07 | 0.026474 | 2.647410e-07 | 0.044950 | 4.495030e-07 |
-| 1,000,000 | 0.266357 | 2.663571e-07 | 0.434762 | 4.347617e-07 | 0.770924 | 7.709238e-07 |
+{make_table(opt_ns, data["optimized"])}
 
 ---
 
@@ -95,10 +154,16 @@ The results show a clear separation in scaling behavior. In the naïve implement
 
 In contrast, the optimized implementation avoids global re-sorting by relying on constant-time average hash indexing for order lookup and price-level access, while using heaps to obtain the best active price without sorting the entire book. Inserts update `orders_by_id` and the relevant price-level dictionary directly, and a heap update is required only when a previously unseen price level is introduced. Amends are constant time on average because they update quantity via `orders_by_id` without structural reordering. Deletes are also constant time on average because removal from both `orders_by_id` and the price-level dictionary is direct; empty price levels are removed from the level maps and any stale heap entries are handled lazily during best-price queries.
 
-At \(N = 10,000\), the measured speedups (total time) are approximately 520.0× for insert, 4207.4× for amend, and 1024.1× for delete. These gains are consistent with replacing repeated global sorts with direct indexing and localized maintenance.
+At \(N = {n_star:,}\), the measured speedups (total time) are approximately {s_ins:.1f}× for insert, {s_amd:.1f}× for amend, and {s_del:.1f}× for delete. These gains are consistent with replacing repeated global sorts with direct indexing and localized maintenance.
 
 ---
 
 ## 8. Conclusion
 
 This benchmark demonstrates that a list-based LOB that re-sorts after every update does not scale, because sorting dominates runtime for insert, amend, and delete. An indexed approach using dictionaries for order lookup and price-level management, together with heaps for best-price retrieval, avoids global re-sorts and supports far larger workloads with low per-operation cost. The optimized design therefore provides a practical foundation for high-volume LOB processing while preserving correct best-bid and best-ask behavior without global sorting.
+"""
+
+with open(OUT_MD, "w", encoding="utf-8") as f:
+    f.write(md)
+
+print(f"Wrote {OUT_MD} from {RESULTS_CSV}")
