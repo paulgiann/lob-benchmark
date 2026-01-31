@@ -2,83 +2,84 @@ import heapq
 
 
 class OptimizedOrderBook:
+    """Optimized limit order book.
+
+    Key idea: avoid full re-sorts and avoid scanning large lists on delete.
+
+    Structures:
+      - orders_by_id: order_id -> order dict (O(1) average lookup)
+      - bid_levels / ask_levels: price -> {order_id -> order dict}
+        * fetching a price level is O(1) (plus O(k) to iterate k orders)
+        * delete within a price level is O(1) average
+      - bid_heap / ask_heap: heaps of prices for best bid/ask with lazy cleanup
+        * stale price entries are popped when querying best bid/ask
+
+    Note: prices are treated as hashable keys. In production you would typically
+    use integer ticks (e.g., cents) or Decimal rather than raw floats.
+    """
+
     def __init__(self):
-        # 1) lookup by order id
+        # 1) Lookup by order ID
         self.orders_by_id = {}
 
-        # 2) price -> list of orders (we store dicts in a list)
-        self.bid_levels = {}  # price -> list of orders
-        self.ask_levels = {}  # price -> list of orders
+        # 2) Price levels (price -> {order_id: order_dict})
+        self.bid_levels = {}
+        self.ask_levels = {}
 
-        # 3) heaps to get best prices fast
-        self.bid_heap = []  # store -price (max-heap via negatives)
-        self.ask_heap = []  # store +price (min-heap)
-
-        # keep counts so we can remove empty price levels lazily
-        self.bid_level_count = {}  # price -> how many orders currently at this price
-        self.ask_level_count = {}
+        # 3) Heaps for best prices (lazy stale cleanup)
+        self.bid_heap = []  # store -price to simulate a max-heap
+        self.ask_heap = []  # store +price as a min-heap
 
     def add_order(self, order):
         oid = order["order_id"]
         price = order["price"]
         side = order["side"]
 
+        # Store canonical reference
         self.orders_by_id[oid] = order
 
         if side == "bid":
-            if price not in self.bid_levels:
-                self.bid_levels[price] = []
+            level = self.bid_levels.get(price)
+            if level is None:
+                level = {}
+                self.bid_levels[price] = level
                 heapq.heappush(self.bid_heap, -price)
-                self.bid_level_count[price] = 0
-            self.bid_levels[price].append(order)
-            self.bid_level_count[price] += 1
-
+            level[oid] = order
         else:
-            if price not in self.ask_levels:
-                self.ask_levels[price] = []
+            level = self.ask_levels.get(price)
+            if level is None:
+                level = {}
+                self.ask_levels[price] = level
                 heapq.heappush(self.ask_heap, price)
-                self.ask_level_count[price] = 0
-            self.ask_levels[price].append(order)
-            self.ask_level_count[price] += 1
+            level[oid] = order
 
     def amend_order(self, order_id, new_quantity):
-        if order_id not in self.orders_by_id:
+        order = self.orders_by_id.get(order_id)
+        if order is None:
             return False
-        self.orders_by_id[order_id]["quantity"] = new_quantity
+        order["quantity"] = new_quantity
         return True
 
     def delete_order(self, order_id):
-        if order_id not in self.orders_by_id:
+        order = self.orders_by_id.pop(order_id, None)
+        if order is None:
             return False
 
-        order = self.orders_by_id.pop(order_id)
         price = order["price"]
         side = order["side"]
 
         if side == "bid":
-            # remove from the level list (scan only within that price level)
-            level_list = self.bid_levels.get(price, [])
-            for i in range(len(level_list)):
-                if level_list[i]["order_id"] == order_id:
-                    level_list.pop(i)
-                    self.bid_level_count[price] -= 1
-                    break
-
-            # if empty, remove dict entry (heap cleanup is lazy)
-            if self.bid_level_count.get(price, 0) == 0:
-                if price in self.bid_levels:
+            level = self.bid_levels.get(price)
+            if level is not None:
+                level.pop(order_id, None)
+                if len(level) == 0:
+                    # Remove empty price level. Heap is cleaned lazily.
                     del self.bid_levels[price]
-
         else:
-            level_list = self.ask_levels.get(price, [])
-            for i in range(len(level_list)):
-                if level_list[i]["order_id"] == order_id:
-                    level_list.pop(i)
-                    self.ask_level_count[price] -= 1
-                    break
-
-            if self.ask_level_count.get(price, 0) == 0:
-                if price in self.ask_levels:
+            level = self.ask_levels.get(price)
+            if level is not None:
+                level.pop(order_id, None)
+                if len(level) == 0:
                     del self.ask_levels[price]
 
         return True
@@ -88,29 +89,30 @@ class OptimizedOrderBook:
     def lookup_by_id(self, order_id):
         return self.orders_by_id.get(order_id, None)
 
-    def orders_at_price(self, price, side=None):
-        if side == "bid":
-            return list(self.bid_levels.get(price, []))
-        if side == "ask":
-            return list(self.ask_levels.get(price, []))
-        # both sides
-        return list(self.bid_levels.get(price, [])) + list(self.ask_levels.get(price, []))
+    def orders_at_price(self, price):
+        # Match NaiveOrderBook API: return orders at this price on both sides
+        bids = list(self.bid_levels.get(price, {}).values())
+        asks = list(self.ask_levels.get(price, {}).values())
+        return bids + asks
 
     def best_bid_ask(self):
-        # best bid: pop stale prices until top is active
+        # Best bid (max price): pop stale prices until top corresponds to a non-empty level
         best_bid = None
-        while len(self.bid_heap) > 0:
+        while self.bid_heap:
             price = -self.bid_heap[0]
-            if price in self.bid_levels and len(self.bid_levels[price]) > 0:
-                best_bid = self.bid_levels[price][0]  # any order at best price
+            level = self.bid_levels.get(price)
+            if level:
+                best_bid = next(iter(level.values()))
                 break
             heapq.heappop(self.bid_heap)
 
+        # Best ask (min price)
         best_ask = None
-        while len(self.ask_heap) > 0:
+        while self.ask_heap:
             price = self.ask_heap[0]
-            if price in self.ask_levels and len(self.ask_levels[price]) > 0:
-                best_ask = self.ask_levels[price][0]
+            level = self.ask_levels.get(price)
+            if level:
+                best_ask = next(iter(level.values()))
                 break
             heapq.heappop(self.ask_heap)
 
